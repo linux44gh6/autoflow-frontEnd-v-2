@@ -1,17 +1,16 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Activity,
-  ArrowUpRight,
+  AlertCircle,
   Check,
-  CircleHelp,
   Code2,
   ExternalLink,
   Globe2,
-  MoreHorizontal,
   Play,
   Radio,
+  RefreshCw,
   ShieldCheck,
   SlidersHorizontal,
   Square,
@@ -19,170 +18,319 @@ import {
   X,
 } from 'lucide-react'
 import type {
+  AutomationAction,
   AutomationConfig,
   AutomationLog,
-  AutomationStatus,
-  AutomationStats,
+  AutomationRunStatus,
+  AutomationState,
+  ScrollSpeed,
 } from '@/lib/automation-types'
 import { automationApi } from '@/lib/automation-api'
 import { IconButton, PageIntro, SectionTitle } from '@/components/automation-dashboard/shared'
 import { DashboardStatistics } from '@/components/automation-dashboard/statistics'
-import { DashboardNavigation } from '@/components/automation-dashboard/navigation'
-
-type HistoryItem = {
-  url: string
-  date: string
-  duration: string
-  iterations: number
-  status: 'Completed' | 'Stopped' | 'Error'
-}
-
-const initialHistory: HistoryItem[] = [
-  { url: 'https://docs.stripe.com', date: 'Today, 10:42 AM', duration: '02m 14s', iterations: 12, status: 'Completed' },
-  { url: 'https://vercel.com/changelog', date: 'Today, 09:18 AM', duration: '01m 06s', iterations: 6, status: 'Stopped' },
-  { url: 'https://developer.mozilla.org', date: 'Yesterday, 04:32 PM', duration: '04m 51s', iterations: 24, status: 'Completed' },
-]
-
-const initialLogs: AutomationLog[] = [
-  { id: 'a', timestamp: '21:30:01', message: '[Sample] Automation started.', level: 'success' },
-  { id: 'b', timestamp: '21:30:02', message: 'Opening website…', level: 'info' },
-  { id: 'c', timestamp: '21:30:04', message: 'Website loaded successfully.', level: 'success' },
-  { id: 'd', timestamp: '21:30:05', message: 'Clicking target link.', level: 'info' },
-  { id: 'e', timestamp: '21:30:06', message: 'New tab opened.', level: 'success' },
-  { id: 'f', timestamp: '21:30:08', message: 'Scrolling page…', level: 'info' },
-  { id: 'g', timestamp: '21:30:15', message: 'Scroll completed.', level: 'success' },
-  { id: 'h', timestamp: '21:30:16', message: 'Waiting for next iteration.', level: 'warning' },
-]
+import {
+  DashboardNavigation,
+  type BackendConnectionState,
+} from '@/components/automation-dashboard/navigation'
 
 const defaultConfig: AutomationConfig = {
   url: '',
-  selector: '',
-  intervalSeconds: 10,
-  actionsPerMinute: 6,
-  scrollSpeed: 'Normal',
-  scrollDelay: 3,
-  maxIterations: null,
-  openInNewTab: true,
-  closeTabAfterScroll: false,
+  selector: 'a',
+  scrollSpeed: 'normal',
+  closeTabAfterScroll: true,
 }
 
-export function AutomationDashboard() {
-  const [config, setConfig] = useState(defaultConfig)
-  const [status, setStatus] = useState<AutomationStatus>({
-    state: 'Idle',
-    currentUrl: '—',
-    iteration: 0,
-    completedIterations: 0,
-    successfulNavigations: 0,
-    failedNavigations: 0,
-    currentAction: 'Ready to start',
-  })
-  const [stats, setStats] = useState<AutomationStats>({
+const initialAutomationState: AutomationState = {
+  status: 'idle',
+  currentUrl: null,
+  currentAction: null,
+  startedAt: null,
+  stats: {
     totalIterations: 0,
     successfulTasks: 0,
     failedTasks: 0,
-    runtimeSeconds: 0,
-  })
-  const [logs, setLogs] = useState<AutomationLog[]>(initialLogs)
-  const [history, setHistory] = useState(initialHistory)
+    runtime: 0,
+  },
+  logs: [],
+}
+
+const STATUS_LABELS: Record<AutomationRunStatus, string> = {
+  idle: 'Idle',
+  running: 'Running',
+  stopping: 'Stopping',
+  completed: 'Completed',
+  error: 'Error',
+}
+
+const ACTION_LABELS: Record<AutomationAction, string> = {
+  opening_page: 'Opening browser tabs',
+  clicking_link: 'Clicking target link',
+  scrolling: 'Scrolling page',
+  waiting: 'Waiting for next cycle',
+  completed: 'Automation completed',
+  error: 'Error occurred',
+}
+
+function formatLogTime(isoTimestamp: string): string {
+  const date = new Date(isoTimestamp)
+  if (Number.isNaN(date.getTime())) return isoTimestamp
+  return date.toLocaleTimeString('en-US', { hour12: false })
+}
+
+export function AutomationDashboard() {
+  const [config, setConfig] = useState<AutomationConfig>(defaultConfig)
+  const [automationState, setAutomationState] = useState<AutomationState>(initialAutomationState)
+  const [logs, setLogs] = useState<AutomationLog[]>([])
+  const [backendStatus, setBackendStatus] = useState<BackendConnectionState>('checking')
+  const [apiError, setApiError] = useState('')
+  const [urlError, setUrlError] = useState('')
+  const [selectorError, setSelectorError] = useState('')
   const [confirmStart, setConfirmStart] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [activeNav, setActiveNav] = useState('Dashboard')
-  const [urlError, setUrlError] = useState('')
+  const [isStarting, setIsStarting] = useState(false)
+  const [isStopping, setIsStopping] = useState(false)
+  const [isRefreshingLogs, setIsRefreshingLogs] = useState(false)
+
   const endRef = useRef<HTMLDivElement>(null)
-  const running = status.state === 'Running'
+  const pollingInFlightRef = useRef(false)
 
+  const running = automationState.status === 'running'
+  const stopping = automationState.status === 'stopping' || isStopping
+  const isActive = running || automationState.status === 'stopping'
+
+  const syncFromBackend = useCallback(async (includeHealth = false) => {
+    if (pollingInFlightRef.current) return
+    pollingInFlightRef.current = true
+
+    try {
+      if (includeHealth) {
+        await automationApi.checkHealth()
+      }
+
+      const [nextStatus, nextLogs] = await Promise.all([
+        automationApi.getStatus(),
+        automationApi.getLogs(),
+      ])
+
+      setBackendStatus('connected')
+      setAutomationState(nextStatus)
+      setLogs(nextLogs)
+    } catch {
+      setBackendStatus('disconnected')
+    } finally {
+      pollingInFlightRef.current = false
+    }
+  }, [])
+
+  // Initial load: check /api/health and hydrate current status & logs
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [logs])
+    void syncFromBackend(true)
+  }, [syncFromBackend])
 
+  // Poll backend: fast (1.5s) while running/stopping, slower (5s) when idle
+  useEffect(() => {
+    const intervalMs = isActive ? 1500 : 5000
+    const timer = window.setInterval(() => {
+      void syncFromBackend(!isActive)
+    }, intervalMs)
+
+    return () => window.clearInterval(timer)
+  }, [isActive, syncFromBackend])
+
+  // Smooth 1-second runtime increment between polls while running
   useEffect(() => {
     if (!running) return
-    const timer = window.setInterval(
-      () => setStats((s) => ({ ...s, runtimeSeconds: s.runtimeSeconds + 1 })),
-      1000,
-    )
+    const timer = window.setInterval(() => {
+      setAutomationState((current) => ({
+        ...current,
+        stats: {
+          ...current.stats,
+          runtime: current.stats.runtime + 1,
+        },
+      }))
+    }, 1000)
+
     return () => window.clearInterval(timer)
   }, [running])
 
-  function addLog(message: string, level: AutomationLog['level'] = 'info') {
-    setLogs((current) => [
-      ...current,
-      {
-        id: `${Date.now()}-${Math.random()}`,
-        timestamp: new Date().toLocaleTimeString('en-US', { hour12: false }),
-        message,
-        level,
-      },
-    ])
-  }
-
-  async function startAutomation() {
-    let parsed: URL
-    try {
-      parsed = new URL(config.url)
-      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error()
-    } catch {
-      setUrlError('Enter a valid website URL beginning with https://')
-      setConfirmStart(false)
-      return
-    }
-
-    setUrlError('')
-    setConfirmStart(false)
-    await automationApi.start(config)
-    setStatus((current) => ({
-      ...current,
-      state: 'Running',
-      currentUrl: parsed.toString(),
-      currentAction: 'Opening page',
-    }))
-    setStats((s) => ({ ...s, runtimeSeconds: 0 }))
-    addLog(`Demo run started for ${parsed.hostname}.`, 'success')
-    addLog('Mock mode: no browser is launched and no website is accessed.', 'warning')
-    addLog('Waiting for next iteration.', 'info')
-  }
-
-  async function stopAutomation() {
-    await automationApi.stop()
-    setStatus((s) => ({ ...s, state: 'Stopping', currentAction: 'Stopping demo run' }))
-    addLog('Stop requested. Ending mock run…', 'warning')
-    window.setTimeout(() => {
-      setStatus((s) => ({ ...s, state: 'Completed', currentAction: 'Run stopped' }))
-      addLog('Demo run stopped.', 'success')
-      setHistory((h) =>
-        [
-          {
-            url: config.url,
-            date: 'Just now',
-            duration: formatDuration(stats.runtimeSeconds),
-            iterations: stats.totalIterations,
-            status: 'Stopped' as const,
-          },
-          ...h,
-        ].slice(0, 4),
-      )
-    }, 500)
-  }
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [logs.length])
 
   function changeConfig<K extends keyof AutomationConfig>(key: K, value: AutomationConfig[K]) {
     setConfig((current) => ({ ...current, [key]: value }))
   }
 
+  function validateForm(): boolean {
+    let valid = true
+
+    try {
+      const parsed = new URL(config.url.trim())
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        setUrlError('Only HTTP and HTTPS URLs are allowed.')
+        valid = false
+      } else if (parsed.username || parsed.password) {
+        setUrlError('URLs containing credentials are not allowed.')
+        valid = false
+      } else {
+        setUrlError('')
+      }
+    } catch {
+      setUrlError('Enter a valid website URL beginning with https:// or http://')
+      valid = false
+    }
+
+    const trimmedSelector = config.selector.trim()
+    if (!trimmedSelector) {
+      setSelectorError('CSS selector is required by the backend.')
+      valid = false
+    } else if (trimmedSelector.length > 500) {
+      setSelectorError('CSS selector must be 500 characters or fewer.')
+      valid = false
+    } else {
+      setSelectorError('')
+    }
+
+    return valid
+  }
+
+  const handleOpenConfirm = useCallback(() => {
+    if (isActive || isStarting || stopping) return
+    setApiError('')
+    if (!validateForm()) return
+    setConfirmStart(true)
+  }, [config.selector, config.url, isActive, isStarting, stopping])
+
+  // Cmd/Ctrl + Enter shortcut to start automation
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault()
+        handleOpenConfirm()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [handleOpenConfirm])
+
+  async function startAutomation() {
+    if (!validateForm()) {
+      setConfirmStart(false)
+      return
+    }
+
+    setConfirmStart(false)
+    setApiError('')
+    setIsStarting(true)
+
+    try {
+      const nextState = await automationApi.start(config)
+      setBackendStatus('connected')
+      setAutomationState(nextState)
+      setLogs(nextState.logs)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to start automation.'
+      setApiError(message)
+      if (message.includes('Unable to connect')) {
+        setBackendStatus('disconnected')
+      }
+    } finally {
+      setIsStarting(false)
+    }
+  }
+
+  async function stopAutomation() {
+    setApiError('')
+    setIsStopping(true)
+    setAutomationState((current) => ({ ...current, status: 'stopping' }))
+
+    try {
+      const nextState = await automationApi.stop()
+      setBackendStatus('connected')
+      setAutomationState(nextState)
+      setLogs(nextState.logs)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to stop automation.'
+      setApiError(message)
+      await syncFromBackend(true)
+    } finally {
+      setIsStopping(false)
+    }
+  }
+
+  async function refreshLogs() {
+    setIsRefreshingLogs(true)
+    try {
+      const nextLogs = await automationApi.getLogs()
+      setLogs(nextLogs)
+      setBackendStatus('connected')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to fetch logs.'
+      setApiError(message)
+      setBackendStatus('disconnected')
+    } finally {
+      setIsRefreshingLogs(false)
+    }
+  }
+
+  const currentActionLabel = automationState.currentAction
+    ? ACTION_LABELS[automationState.currentAction]
+    : stopping
+      ? 'Stopping automation…'
+      : 'Ready to start'
+
+  const statusLabel = STATUS_LABELS[automationState.status]
+
   return (
     <div className="app-shell">
       <DashboardNavigation
         sidebarOpen={sidebarOpen}
-        activeNav={activeNav}
-        onSelect={setActiveNav}
+        backendStatus={backendStatus}
         onClose={() => setSidebarOpen(false)}
         onOpen={() => setSidebarOpen(true)}
       />
 
       <main className="main-area">
         <div className="content">
-          <PageIntro onDocumentation={() => setActiveNav('Documentation')} />
-          <DashboardStatistics stats={stats} running={running} />
+          <PageIntro />
+
+          {backendStatus === 'disconnected' && (
+            <div className="api-error-banner" role="alert">
+              <span className="api-error-icon">
+                <AlertCircle size={16} />
+              </span>
+              <p>
+                <strong>Backend server unreachable</strong>
+                <span>
+                  Make sure the AutoFlow backend is running on port 5000 (or set{' '}
+                  <code>BACKEND_URL</code>).
+                </span>
+              </p>
+              <button
+                className="outline-button"
+                onClick={() => void syncFromBackend(true)}
+              >
+                Retry
+              </button>
+            </div>
+          )}
+
+          {apiError && (
+            <div className="api-error-banner" role="alert">
+              <span className="api-error-icon">
+                <AlertCircle size={16} />
+              </span>
+              <p>
+                <strong>API error</strong>
+                <span>{apiError}</span>
+              </p>
+              <IconButton label="Dismiss error" onClick={() => setApiError('')}>
+                <X size={15} />
+              </IconButton>
+            </div>
+          )}
+
+          <DashboardStatistics stats={automationState.stats} running={running} />
 
           <div className="dashboard-grid">
             <section className="panel config-panel">
@@ -205,6 +353,7 @@ export function AutomationDashboard() {
                     <input
                       aria-label="Website URL"
                       type="url"
+                      disabled={isActive || isStarting}
                       value={config.url}
                       onChange={(e) => {
                         changeConfig('url', e.target.value)
@@ -219,18 +368,29 @@ export function AutomationDashboard() {
 
                 <label className="field">
                   <span>
-                    Link selector <small>OPTIONAL</small>
+                    CSS selector <b className="required">*</b>
                   </span>
-                  <div className="input-wrap">
+                  <div className={`input-wrap ${selectorError ? 'input-error' : ''}`}>
                     <Code2 size={16} />
                     <input
-                      aria-label="Link selector"
+                      aria-label="CSS selector"
+                      disabled={isActive || isStarting}
                       value={config.selector}
-                      onChange={(e) => changeConfig('selector', e.target.value)}
+                      onChange={(e) => {
+                        changeConfig('selector', e.target.value)
+                        setSelectorError('')
+                      }}
                       placeholder="a.visit-link"
+                      aria-invalid={Boolean(selectorError)}
                     />
                   </div>
-                  <small className="field-help">CSS selector for links to interact with.</small>
+                  {selectorError ? (
+                    <small className="error-text">{selectorError}</small>
+                  ) : (
+                    <small className="field-help">
+                      Required by backend validation (1–500 characters).
+                    </small>
+                  )}
                 </label>
 
                 <div className="form-divider" />
@@ -240,103 +400,24 @@ export function AutomationDashboard() {
                   <span>Run settings</span>
                 </div>
 
-                <div className="settings-grid">
-                  <label className="field">
-                    <span>Click interval</span>
-                    <div className="number-wrap">
-                      <input
-                        aria-label="Click interval in seconds"
-                        type="number"
-                        min="1"
-                        max="300"
-                        value={config.intervalSeconds}
-                        onChange={(e) => changeConfig('intervalSeconds', Number(e.target.value))}
-                      />
-                      <span>sec</span>
-                    </div>
-                  </label>
-
-                  <label className="field">
-                    <span>Actions per minute</span>
-                    <select
-                      aria-label="Actions per minute"
-                      value={config.actionsPerMinute}
-                      onChange={(e) => changeConfig('actionsPerMinute', Number(e.target.value))}
-                    >
-                      <option value={5}>5 actions</option>
-                      <option value={6}>6 actions</option>
-                    </select>
-                  </label>
-
-                  <label className="field">
-                    <span>Scroll speed</span>
-                    <select
-                      aria-label="Scroll speed"
-                      value={config.scrollSpeed}
-                      onChange={(e) =>
-                        changeConfig('scrollSpeed', e.target.value as AutomationConfig['scrollSpeed'])
-                      }
-                    >
-                      <option>Slow</option>
-                      <option>Normal</option>
-                      <option>Fast</option>
-                    </select>
-                  </label>
-
-                  <label className="field">
-                    <span>Scroll delay</span>
-                    <div className="number-wrap">
-                      <input
-                        aria-label="Scroll delay in seconds"
-                        type="number"
-                        min="0"
-                        max="60"
-                        value={config.scrollDelay}
-                        onChange={(e) => changeConfig('scrollDelay', Number(e.target.value))}
-                      />
-                      <span>sec</span>
-                    </div>
-                  </label>
-
-                  <label className="field">
-                    <span>Maximum iterations</span>
-                    <div className="number-wrap">
-                      <input
-                        aria-label="Maximum iterations"
-                        type="number"
-                        min="1"
-                        max="10000"
-                        placeholder="Unlimited"
-                        value={config.maxIterations ?? ''}
-                        onChange={(e) =>
-                          changeConfig(
-                            'maxIterations',
-                            e.target.value
-                              ? Math.min(10000, Math.max(1, Number(e.target.value)))
-                              : null,
-                          )
-                        }
-                      />
-                      <span>runs</span>
-                    </div>
-                  </label>
-
-                  <label className="field">
-                    <span>Open links in</span>
-                    <select
-                      aria-label="Open links in"
-                      value={config.openInNewTab ? 'new' : 'same'}
-                      onChange={(e) => changeConfig('openInNewTab', e.target.value === 'new')}
-                    >
-                      <option value="new">New tab</option>
-                      <option value="same">Same tab</option>
-                    </select>
-                  </label>
-                </div>
+                <label className="field">
+                  <span>Scroll speed</span>
+                  <select
+                    aria-label="Scroll speed"
+                    disabled={isActive || isStarting}
+                    value={config.scrollSpeed}
+                    onChange={(e) => changeConfig('scrollSpeed', e.target.value as ScrollSpeed)}
+                  >
+                    <option value="slow">Slow</option>
+                    <option value="normal">Normal</option>
+                    <option value="fast">Fast</option>
+                  </select>
+                </label>
 
                 <label className="check-row">
                   <input
                     type="checkbox"
+                    disabled={isActive || isStarting}
                     checked={config.closeTabAfterScroll}
                     onChange={(e) => changeConfig('closeTabAfterScroll', e.target.checked)}
                   />
@@ -344,27 +425,37 @@ export function AutomationDashboard() {
                     <Check size={13} />
                   </span>
                   <span>Close tab after scrolling</span>
-                  <small>Closes each opened tab after the scroll action.</small>
+                  <small>Closes opened browser tabs after each cycle.</small>
                 </label>
 
                 <div className="button-row">
                   <button
                     className="start-button"
-                    disabled={running || status.state === 'Stopping'}
-                    onClick={() => setConfirmStart(true)}
+                    disabled={isActive || isStarting || stopping || backendStatus === 'disconnected'}
+                    onClick={handleOpenConfirm}
                   >
                     <Play size={15} fill="currentColor" />
-                    {running ? 'Automation running' : 'Start automation'}
+                    {isStarting
+                      ? 'Starting…'
+                      : running
+                        ? 'Automation running'
+                        : stopping
+                          ? 'Stopping…'
+                          : 'Start automation'}
                     <span className="button-shortcut">⌘ ↵</span>
                   </button>
-                  <button className="stop-button" disabled={!running} onClick={stopAutomation}>
+                  <button
+                    className="stop-button"
+                    disabled={!running || stopping}
+                    onClick={stopAutomation}
+                  >
                     <Square size={14} fill="currentColor" />
-                    Stop
+                    {stopping ? 'Stopping' : 'Stop'}
                   </button>
                 </div>
 
                 <p className="api-footnote">
-                  <ShieldCheck size={13} /> Settings are kept in this session only.
+                  <ShieldCheck size={13} /> Runs continuously via Playwright backend until stopped.
                 </p>
               </div>
             </section>
@@ -375,9 +466,9 @@ export function AutomationDashboard() {
                   eyebrow="LIVE MONITOR"
                   title="Run status"
                   trailing={
-                    <span className={`status-pill ${status.state.toLowerCase()}`}>
+                    <span className={`status-pill ${automationState.status}`}>
                       <span />
-                      {status.state}
+                      {statusLabel}
                     </span>
                   }
                 />
@@ -388,31 +479,38 @@ export function AutomationDashboard() {
                   </span>
                   <span>
                     <small>CURRENT URL</small>
-                    <strong>{status.currentUrl}</strong>
+                    <strong>{automationState.currentUrl || '—'}</strong>
                   </span>
-                  <button aria-label="Open current URL" disabled={status.currentUrl === '—'}>
+                  <button
+                    aria-label="Open current URL"
+                    disabled={!automationState.currentUrl}
+                    onClick={() => {
+                      if (automationState.currentUrl) {
+                        window.open(automationState.currentUrl, '_blank', 'noopener,noreferrer')
+                      }
+                    }}
+                  >
                     <ExternalLink size={14} />
                   </button>
                 </div>
 
                 <div className="status-metrics">
                   <div>
-                    <small>Current iteration</small>
+                    <small>Total cycles</small>
                     <strong>
-                      {String(status.iteration).padStart(2, '0')}
-                      <i> / {config.maxIterations ?? '∞'}</i>
+                      {String(automationState.stats.totalIterations).padStart(2, '0')}
                     </strong>
                   </div>
                   <div>
-                    <small>Completed</small>
-                    <strong>{String(status.completedIterations).padStart(2, '0')}</strong>
+                    <small>Successful</small>
+                    <strong className="nav-success">
+                      {String(automationState.stats.successfulTasks).padStart(2, '0')}
+                    </strong>
                   </div>
                   <div>
-                    <small>Navigation</small>
-                    <strong className="nav-success">
-                      {status.successfulNavigations}
-                      <i> / </i>
-                      <span className="nav-failed">{status.failedNavigations}</span>
+                    <small>Failed</small>
+                    <strong className={automationState.stats.failedTasks > 0 ? 'nav-failed' : ''}>
+                      {String(automationState.stats.failedTasks).padStart(2, '0')}
                     </strong>
                   </div>
                 </div>
@@ -423,11 +521,19 @@ export function AutomationDashboard() {
                   </span>
                   <span>
                     <small>CURRENT ACTION</small>
-                    <strong>{status.currentAction}</strong>
+                    <strong>{currentActionLabel}</strong>
                   </span>
                   <span className="action-time">
-                    <span className={running ? 'pulse-dot' : 'idle-dot'} />
-                    {running ? 'Live' : 'Idle'}
+                    <span
+                      className={
+                        running
+                          ? 'pulse-dot online'
+                          : stopping
+                            ? 'pulse-dot'
+                            : 'idle-dot'
+                      }
+                    />
+                    {running ? 'Live' : statusLabel}
                   </span>
                 </div>
               </section>
@@ -439,8 +545,12 @@ export function AutomationDashboard() {
                   trailing={
                     <div className="log-actions">
                       <span className="log-count">{logs.length} events</span>
-                      <IconButton label="Clear activity logs" onClick={() => setLogs([])}>
-                        <X size={15} />
+                      <IconButton
+                        label="Refresh activity logs"
+                        disabled={isRefreshingLogs}
+                        onClick={() => void refreshLogs()}
+                      >
+                        <RefreshCw size={14} className={isRefreshingLogs ? 'animate-spin' : ''} />
                       </IconButton>
                     </div>
                   }
@@ -450,103 +560,65 @@ export function AutomationDashboard() {
                   <span>
                     <Terminal size={13} /> SESSION OUTPUT
                   </span>
-                  <span className="terminal-live">
-                    <span className="idle-dot" />
-                    MOCK DATA
+                  <span
+                    className={`terminal-live ${
+                      backendStatus === 'connected'
+                        ? 'online'
+                        : backendStatus === 'disconnected'
+                          ? 'offline'
+                          : ''
+                    }`}
+                  >
+                    <span
+                      className={
+                        running
+                          ? 'pulse-dot online'
+                          : backendStatus === 'connected'
+                            ? 'pulse-dot online'
+                            : backendStatus === 'disconnected'
+                              ? 'pulse-dot offline'
+                              : 'idle-dot'
+                      }
+                    />
+                    {running
+                      ? 'LIVE STREAM'
+                      : backendStatus === 'connected'
+                        ? 'API CONNECTED'
+                        : backendStatus === 'disconnected'
+                          ? 'OFFLINE'
+                          : 'CONNECTING'}
                   </span>
                 </div>
 
                 <div className="log-list" aria-live="polite" aria-label="Automation activity log">
                   {logs.length ? (
-                    logs.map((log) => (
-                      <div className={`log-row ${log.level}`} key={log.id}>
+                    logs.map((log, index) => (
+                      <div className={`log-row ${log.type}`} key={`${log.timestamp}-${index}`}>
                         <span className="log-dot" />
-                        <time>{log.timestamp}</time>
+                        <time>{formatLogTime(log.timestamp)}</time>
                         <span className="log-message">{log.message}</span>
                       </div>
                     ))
                   ) : (
-                    <div className="logs-empty">No events yet. Start a demo run to see activity.</div>
+                    <div className="logs-empty">
+                      No events yet. Start an automation run to see live backend logs.
+                    </div>
                   )}
                   <div ref={endRef} />
                 </div>
 
                 <div className="log-footer">
                   <span>
-                    <span className="pulse-dot" />
-                    Following latest
+                    <span className={running ? 'pulse-dot online' : 'idle-dot'} />
+                    {running ? 'Following latest (1.5s)' : 'Synced with backend'}
                   </span>
                   <span>
-                    UTF-8 <span className="footer-divider">·</span> Local session
+                    UTF-8 <span className="footer-divider">·</span> AutoFlow API
                   </span>
                 </div>
               </section>
             </div>
           </div>
-
-          <section className="panel history-panel">
-            <SectionTitle
-              eyebrow="RECENT ACTIVITY"
-              title="Automation history"
-              trailing={
-                <button className="text-button" onClick={() => setActiveNav('Automation history')}>
-                  View all <ArrowUpRight size={14} />
-                </button>
-              }
-            />
-
-            <div className="table-scroll">
-              <table>
-                <thead>
-                  <tr>
-                    <th>WEBSITE URL</th>
-                    <th>STARTED AT</th>
-                    <th>DURATION</th>
-                    <th>ITERATIONS</th>
-                    <th>STATUS</th>
-                    <th aria-label="Actions" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {history.map((item, index) => (
-                    <tr key={`${item.url}-${index}`}>
-                      <td>
-                        <span className="site-cell">
-                          <span className="site-favicon">
-                            <Globe2 size={14} />
-                          </span>
-                          <span>{item.url}</span>
-                        </span>
-                      </td>
-                      <td>{item.date}</td>
-                      <td>{item.duration}</td>
-                      <td>{item.iterations}</td>
-                      <td>
-                        <span className={`history-status ${item.status.toLowerCase()}`}>
-                          <span />
-                          {item.status}
-                        </span>
-                      </td>
-                      <td>
-                        <button className="row-action" aria-label={`More actions for ${item.url}`}>
-                          <MoreHorizontal size={17} />
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="history-foot">
-              <span>
-                Showing <strong>{history.length}</strong> recent runs
-              </span>
-              <button onClick={() => setHistory(initialHistory)}>
-                Reset demo data <ArrowUpRight size={13} />
-              </button>
-            </div>
-          </section>
 
           <footer className="page-footer">
             <span>
@@ -555,7 +627,13 @@ export function AutomationDashboard() {
               </span>{' '}
               Browser automation, made observable.
             </span>
-            <span>Demo UI · API integration ready</span>
+            <span>
+              {backendStatus === 'connected'
+                ? 'Live API connected'
+                : backendStatus === 'disconnected'
+                  ? 'Backend disconnected'
+                  : 'Connecting to backend…'}
+            </span>
           </footer>
         </div>
       </main>
@@ -584,19 +662,19 @@ export function AutomationDashboard() {
             >
               <X size={17} />
             </button>
-            <p className="eyebrow">START DEMO RUN</p>
+            <p className="eyebrow">START AUTOMATION</p>
             <h2 id="confirm-title">Ready to start?</h2>
             <p className="dialog-description">
-              This is a frontend-only simulation. It will not open a browser or visit{' '}
-              <strong>{config.url || 'your target URL'}</strong>.
+              This will launch Chromium on the backend and run continuous tab cycles for{' '}
+              <strong>{config.url.trim()}</strong> until you stop it.
             </p>
             <div className="dialog-meta">
-              <span>Run target</span>
-              <strong>{config.url || 'No URL entered'}</strong>
-              <span>Mode</span>
-              <strong>
-                <span className="idle-dot" /> Simulated
-              </strong>
+              <span>Target URL</span>
+              <strong>{config.url.trim()}</strong>
+              <span>Selector</span>
+              <strong>{config.selector.trim()}</strong>
+              <span>Scroll speed</span>
+              <strong style={{ textTransform: 'capitalize' }}>{config.scrollSpeed}</strong>
             </div>
             <div className="dialog-actions">
               <button className="outline-button" onClick={() => setConfirmStart(false)}>
@@ -604,7 +682,7 @@ export function AutomationDashboard() {
               </button>
               <button className="start-button" onClick={startAutomation}>
                 <Play size={14} fill="currentColor" />
-                Start demo
+                Start automation
               </button>
             </div>
           </section>
@@ -612,8 +690,4 @@ export function AutomationDashboard() {
       )}
     </div>
   )
-}
-
-function formatDuration(seconds: number) {
-  return `${String(Math.floor(seconds / 60)).padStart(2, '0')}m ${String(seconds % 60).padStart(2, '0')}s`
 }
